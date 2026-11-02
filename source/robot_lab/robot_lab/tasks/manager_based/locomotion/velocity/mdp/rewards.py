@@ -267,6 +267,243 @@ class GaitReward(ManagerTermBase):
         return torch.exp(-(se_act_0 + se_act_1) / self.std)
 
 
+class TrotContactPatternReward(ManagerTermBase):
+    """Give a dense score for a two-foot diagonal contact pattern.
+
+    A perfect diagonal stance scores one.  One or three contacts receive a
+    small partial score, while zero contacts, four contacts, and a two-foot
+    non-diagonal stance score zero.  This gives PPO a path toward a trot instead
+    of requiring it to discover a perfect binary pattern by chance.
+    """
+
+    def __init__(self, cfg: RewTerm, env: ManagerBasedRLEnv):
+        super().__init__(cfg, env)
+        self.command_name: str = cfg.params["command_name"]
+        self.command_threshold: float = cfg.params["command_threshold"]
+        self.force_threshold: float = cfg.params["force_threshold"]
+        self.contact_sensor: ContactSensor = env.scene.sensors[cfg.params["sensor_cfg"].name]
+
+        pair_names = cfg.params["synced_feet_pair_names"]
+        if len(pair_names) != 2 or any(len(pair) != 2 for pair in pair_names):
+            raise ValueError("Trot contact reward requires two diagonal foot pairs.")
+
+        pair_0 = self.contact_sensor.find_bodies(pair_names[0])[0]
+        pair_1 = self.contact_sensor.find_bodies(pair_names[1])[0]
+        self.pair_0 = (pair_0[0], pair_0[1])
+        self.pair_1 = (pair_1[0], pair_1[1])
+
+    def __call__(
+        self,
+        env: ManagerBasedRLEnv,
+        command_name: str,
+        command_threshold: float,
+        force_threshold: float,
+        synced_feet_pair_names,
+        sensor_cfg: SceneEntityCfg,
+    ) -> torch.Tensor:
+        # This reward needs the instantaneous contact state.  Using the
+        # history buffer here makes a foot remain "in contact" for several
+        # frames and can make both diagonal pairs appear active at once.
+        forces = self.contact_sensor.data.net_normal_forces_w.torch
+        contacts = forces.norm(dim=-1) > self.force_threshold
+
+        p0_a, p0_b = self.pair_0
+        p1_a, p1_b = self.pair_1
+
+        selected_contacts = torch.stack(
+            (contacts[:, p0_a], contacts[:, p0_b], contacts[:, p1_a], contacts[:, p1_b]), dim=1
+        )
+        contact_count = selected_contacts.float().sum(dim=1)
+        two_contact_score = torch.clamp(1.0 - torch.abs(contact_count - 2.0) / 2.0, min=0.0)
+
+        pair_0_mismatch = torch.logical_xor(contacts[:, p0_a], contacts[:, p0_b]).float()
+        pair_1_mismatch = torch.logical_xor(contacts[:, p1_a], contacts[:, p1_b]).float()
+        diagonal_sync_score = 1.0 - 0.5 * (pair_0_mismatch + pair_1_mismatch)
+        reward = two_contact_score * diagonal_sync_score
+
+        command_active = torch.linalg.norm(env.command_manager.get_command(self.command_name), dim=1)
+        reward *= command_active > self.command_threshold
+        reward *= torch.clamp(-env.scene["robot"].data.projected_gravity_b.torch[:, 2], 0, 0.7) / 0.7
+        return reward
+
+
+class WalkContactClockReward(ManagerTermBase):
+    """Match four foot contacts to a slow four-beat walking clock.
+
+    The target contact sequence is supplied through ``foot_names`` and
+    ``foot_phase_offsets``.  A perfect match scores one and a completely wrong
+    pattern scores minus one.  The policy receives the same clock as a phase
+    observation, so the requested cadence is observable rather than implicit.
+    """
+
+    def __init__(self, cfg: RewTerm, env: ManagerBasedRLEnv):
+        super().__init__(cfg, env)
+        self.command_name: str = cfg.params["command_name"]
+        self.command_threshold: float = cfg.params["command_threshold"]
+        self.force_threshold: float = cfg.params["force_threshold"]
+        self.cycle_time: float = cfg.params["cycle_time"]
+        self.stance_ratio: float = cfg.params["stance_ratio"]
+        self.contact_sensor: ContactSensor = env.scene.sensors[cfg.params["sensor_cfg"].name]
+
+        foot_names = cfg.params["foot_names"]
+        phase_offsets = cfg.params["foot_phase_offsets"]
+        if len(foot_names) != 4 or len(phase_offsets) != 4:
+            raise ValueError("Walk contact clock requires four foot names and four phase offsets.")
+        self.foot_ids = [self.contact_sensor.find_bodies(name)[0][0] for name in foot_names]
+        self.phase_offsets = torch.tensor(phase_offsets, device=env.device, dtype=torch.float32)
+
+    def __call__(
+        self,
+        env: ManagerBasedRLEnv,
+        command_name: str,
+        command_threshold: float,
+        force_threshold: float,
+        cycle_time: float,
+        stance_ratio: float,
+        foot_names,
+        foot_phase_offsets,
+        sensor_cfg: SceneEntityCfg,
+    ) -> torch.Tensor:
+        forces = self.contact_sensor.data.net_normal_forces_w.torch[:, self.foot_ids]
+        observed_contacts = forces.norm(dim=-1) > self.force_threshold
+
+        episode_time = env.episode_length_buf.float() * env.step_dt
+        global_phase = torch.remainder(episode_time / self.cycle_time, 1.0)
+        foot_phase = torch.remainder(global_phase[:, None] - self.phase_offsets[None, :], 1.0)
+        target_contacts = foot_phase < self.stance_ratio
+
+        # Score stance and swing feet separately, with missed swing contacts
+        # weighted twice. Keeping all four feet planted must be actively bad
+        # (score -1), not merely neutral, or velocity tracking wins and the
+        # policy learns a shuffling/sliding gait.
+        stance_correct = (observed_contacts & target_contacts).float()
+        swing_correct = ((~observed_contacts) & (~target_contacts)).float()
+        stance_accuracy = stance_correct.sum(dim=1) / target_contacts.float().sum(dim=1).clamp_min(1.0)
+        swing_accuracy = swing_correct.sum(dim=1) / (~target_contacts).float().sum(dim=1).clamp_min(1.0)
+        reward = stance_accuracy + 2.0 * swing_accuracy - 2.0
+        command_active = torch.linalg.norm(env.command_manager.get_command(self.command_name), dim=1)
+        reward *= command_active > self.command_threshold
+        reward *= torch.clamp(-env.scene["robot"].data.projected_gravity_b.torch[:, 2], 0, 0.7) / 0.7
+        return reward
+
+
+class WalkSwingMotionReward(ManagerTermBase):
+    """Track a clocked forward-and-up swing trajectory for each foot.
+
+    Contact timing alone does not define a useful step: a policy can chatter a
+    foot in place or slide while technically changing contact state. This term
+    gives every scheduled swing foot a dense target for forward velocity and a
+    smooth vertical clearance arc.
+    """
+
+    def __init__(self, cfg: RewTerm, env: ManagerBasedRLEnv):
+        super().__init__(cfg, env)
+        self.command_name: str = cfg.params["command_name"]
+        self.command_threshold: float = cfg.params["command_threshold"]
+        self.cycle_time: float = cfg.params["cycle_time"]
+        self.stance_ratio: float = cfg.params["stance_ratio"]
+        self.ground_height_world: float = cfg.params["ground_height_world"]
+        self.clearance: float = cfg.params["clearance"]
+        self.velocity_std: float = cfg.params["velocity_std"]
+        self.height_std: float = cfg.params["height_std"]
+        self.force_threshold: float = cfg.params["force_threshold"]
+        self.asset: Articulation = env.scene[cfg.params["asset_cfg"].name]
+        self.contact_sensor: ContactSensor = env.scene.sensors[cfg.params["sensor_cfg"].name]
+
+        foot_names = cfg.params["foot_names"]
+        phase_offsets = cfg.params["foot_phase_offsets"]
+        if len(foot_names) != 4 or len(phase_offsets) != 4:
+            raise ValueError("Walk swing motion requires four foot names and four phase offsets.")
+        self.foot_ids = [self.asset.find_bodies(name)[0][0] for name in foot_names]
+        self.sensor_foot_ids = [self.contact_sensor.find_bodies(name)[0][0] for name in foot_names]
+        self.phase_offsets = torch.tensor(phase_offsets, device=env.device, dtype=torch.float32)
+
+    def __call__(
+        self,
+        env: ManagerBasedRLEnv,
+        command_name: str,
+        command_threshold: float,
+        cycle_time: float,
+        stance_ratio: float,
+        ground_height_world: float,
+        clearance: float,
+        velocity_std: float,
+        height_std: float,
+        force_threshold: float,
+        foot_names,
+        foot_phase_offsets,
+        asset_cfg: SceneEntityCfg,
+        sensor_cfg: SceneEntityCfg,
+    ) -> torch.Tensor:
+        foot_vel_rel = self.asset.data.body_lin_vel_w.torch[:, self.foot_ids, :] - self.asset.data.root_lin_vel_w.torch[:, None, :]
+        root_quat = self.asset.data.root_quat_w.torch[:, None, :].expand(-1, len(self.foot_ids), -1)
+        foot_vel_b = math_utils.quat_apply_inverse(root_quat, foot_vel_rel)
+        foot_height_w = self.asset.data.body_pos_w.torch[:, self.foot_ids, 2]
+        forces = self.contact_sensor.data.net_normal_forces_w.torch[:, self.sensor_foot_ids]
+        airborne = forces.norm(dim=-1) <= self.force_threshold
+
+        episode_time = env.episode_length_buf.float() * env.step_dt
+        global_phase = torch.remainder(episode_time / self.cycle_time, 1.0)
+        foot_phase = torch.remainder(global_phase[:, None] - self.phase_offsets[None, :], 1.0)
+        swing_mask = foot_phase >= self.stance_ratio
+        swing_progress = torch.clamp(
+            (foot_phase - self.stance_ratio) / (1.0 - self.stance_ratio), min=0.0, max=1.0
+        )
+
+        command = env.command_manager.get_command(self.command_name)
+        # A stance foot travels backward relative to the body. To close that
+        # loop during swing, its mean forward speed follows the duty ratio.
+        target_swing_vx = torch.clamp(
+            command[:, 0].abs() * self.stance_ratio / (1.0 - self.stance_ratio), max=0.65
+        )
+        velocity_score = torch.exp(
+            -torch.square(foot_vel_b[:, :, 0] - target_swing_vx[:, None]) / self.velocity_std**2
+        )
+
+        # The foot mesh is about 4 cm high, so its link center is near z=0.02
+        # on the flat plane. A world-frame arc cannot be faked by bobbing the
+        # base relative to a planted foot.
+        target_z = self.ground_height_world + self.clearance * torch.sin(torch.pi * swing_progress)
+        height_score = torch.exp(-torch.square(foot_height_w - target_z) / self.height_std**2)
+        trajectory_score = 0.55 * velocity_score + 0.45 * height_score
+
+        # Hard gate: a scheduled swing foot earns trajectory reward only when
+        # the contact sensor confirms it is airborne. Remaining in contact is
+        # explicitly penalized, closing the previous shuffling loophole.
+        per_foot_score = torch.where(airborne, 0.25 + 0.75 * trajectory_score, -torch.ones_like(trajectory_score))
+        reward = (per_foot_score * swing_mask.float()).sum(dim=1) / swing_mask.float().sum(dim=1).clamp_min(1.0)
+
+        command_active = torch.linalg.norm(command, dim=1) > self.command_threshold
+        reward *= command_active
+        reward *= torch.clamp(-self.asset.data.projected_gravity_b.torch[:, 2], 0, 0.7) / 0.7
+        return reward
+
+
+def short_foot_phase_penalty(
+    env: ManagerBasedRLEnv,
+    command_name: str,
+    command_threshold: float,
+    min_air_time: float,
+    min_contact_time: float,
+    sensor_cfg: SceneEntityCfg,
+) -> torch.Tensor:
+    """Penalize rapid foot contact chatter while a motion command is active."""
+    contact_sensor: ContactSensor = env.scene.sensors[sensor_cfg.name]
+    first_contact = contact_sensor.compute_first_contact(env.step_dt).torch[:, sensor_cfg.body_ids]
+    first_air = contact_sensor.compute_first_air(env.step_dt).torch[:, sensor_cfg.body_ids]
+    last_air_time = contact_sensor.data.last_air_time.torch[:, sensor_cfg.body_ids]
+    last_contact_time = contact_sensor.data.last_contact_time.torch[:, sensor_cfg.body_ids]
+
+    short_air = torch.relu(min_air_time - last_air_time) * first_contact
+    short_contact = torch.relu(min_contact_time - last_contact_time) * first_air
+    penalty = torch.sum(short_air + short_contact, dim=1)
+
+    command_active = torch.linalg.norm(env.command_manager.get_command(command_name), dim=1)
+    penalty *= command_active > command_threshold
+    penalty *= torch.clamp(-env.scene["robot"].data.projected_gravity_b.torch[:, 2], 0, 0.7) / 0.7
+    return penalty
+
+
 def joint_mirror(env: ManagerBasedRLEnv, asset_cfg: SceneEntityCfg, mirror_joints: list[list[str]]) -> torch.Tensor:
     # extract the used quantities (to enable type-hinting)
     asset: Articulation = env.scene[asset_cfg.name]
