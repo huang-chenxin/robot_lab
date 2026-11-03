@@ -365,6 +365,7 @@ class WalkContactClockReward(ManagerTermBase):
         sensor_cfg: SceneEntityCfg,
     ) -> torch.Tensor:
         forces = self.contact_sensor.data.net_normal_forces_w.torch[:, self.foot_ids]
+        # observed_contacts = [True, True, True, False] 前三只着地，第四只腾空
         observed_contacts = forces.norm(dim=-1) > self.force_threshold
 
         episode_time = env.episode_length_buf.float() * env.step_dt

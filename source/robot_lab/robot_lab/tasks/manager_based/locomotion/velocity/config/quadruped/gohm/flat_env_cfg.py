@@ -50,7 +50,9 @@ class GohmFlatEnvCfg(GohmRoughEnvCfg):
         # 固定世界朝向为 0，发生偏转时自动给出纠偏命令
         self.commands.base_velocity.heading_command = True
         self.commands.base_velocity.heading_control_stiffness = 0.8
-        self.commands.base_velocity.rel_standing_envs = 0.1
+        # This curriculum stage focuses exclusively on walking. Reintroduce
+        # standing commands only after the four-beat contact order is stable.
+        self.commands.base_velocity.rel_standing_envs = 0.0
         self.commands.base_velocity.debug_vis = True
 
         self.commands.base_velocity.ranges.lin_vel_x = (0.3, 0.3)
@@ -113,7 +115,7 @@ class GohmFlatEnvCfg(GohmRoughEnvCfg):
             # 对角小跑、防滑和动作平滑
             self.rewards.feet_gait.weight = 0.0
             self.rewards.feet_slide.weight = -0.7
-            self.rewards.action_rate_l2.weight = -0.03
+            self.rewards.action_rate_l2.weight = -0.05
 
             # 减少高频碎步
             self.rewards.walk_contact_clock = RewTerm(
@@ -123,16 +125,18 @@ class GohmFlatEnvCfg(GohmRoughEnvCfg):
                     "command_name": "base_velocity",
                     "command_threshold": 0.1,
                     "force_threshold": 1.0,
+                    # 走完一轮需要 0.8 s，四个足等间隔
                     "cycle_time": 0.8,
-                    "stance_ratio": 0.65,
-                    # Lateral-sequence four-beat walk: left hind, left fore,
-                    # right hind, right fore.
+                    # 每只脚有多少比例的时间着地
+                    "stance_ratio": 0.75,
+                    # 四只脚的排列顺序
                     "foot_names": (
                         "RL_foot_joint",
                         "FL_foot_joint",
                         "RR_foot_joint",
                         "FR_foot_joint",
                     ),
+                    # 每只脚相隔四分之一个周期
                     "foot_phase_offsets": (0.0, 0.25, 0.5, 0.75),
                     "sensor_cfg": SceneEntityCfg("contact_forces"),
                 },
@@ -144,7 +148,7 @@ class GohmFlatEnvCfg(GohmRoughEnvCfg):
                     "command_name": "base_velocity",
                     "command_threshold": 0.1,
                     "cycle_time": 0.8,
-                    "stance_ratio": 0.65,
+                    "stance_ratio": 0.75,
                     # The foot mesh is 4 cm high: link-center z=0.02 is contact,
                     # and the 6 cm arc gives about 6 cm sole clearance at mid-swing.
                     "ground_height_world": 0.02,
@@ -169,15 +173,17 @@ class GohmFlatEnvCfg(GohmRoughEnvCfg):
                 params={
                     "command_name": "base_velocity",
                     "command_threshold": 0.1,
-                    "min_air_time": 0.20,
+                    # The clock requests a 0.20 s swing. Keep this slightly
+                    # lower to allow for the discrete contact transition.
+                    "min_air_time": 0.17,
                     "min_contact_time": 0.16,
                     "sensor_cfg": SceneEntityCfg("contact_forces", body_names=[self.foot_link_name]),
                 },
             )
-            # A small landing bonus above 0.22 s discourages rapid toe-tapping
-            # without forcing unrealistically long aerial phases at 0.3 m/s.
+            # Keep the landing threshold below the clock's 0.20 s swing so a
+            # correctly timed step is not punished for ending on schedule.
             self.rewards.feet_air_time.weight = 0.2
-            self.rewards.feet_air_time.params["threshold"] = 0.22
+            self.rewards.feet_air_time.params["threshold"] = 0.18
             self.rewards.feet_air_time.params["sensor_cfg"].body_names = [self.foot_link_name]
 
             # The generic term applies one constant height to stance and swing
